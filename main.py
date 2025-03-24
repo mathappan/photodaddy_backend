@@ -7,9 +7,13 @@ import boto3
 import traceback
 import json
 from prompts import all_prompts
-from typing import Optional
+from typing import Optional, Tuple
 from supabase import create_client, Client
-import requests
+from PIL import Image
+import io
+import random
+
+MAX_SIZE_MB = 5
 
 app = FastAPI()
 
@@ -49,6 +53,75 @@ s3_client = boto3.client(
     aws_secret_access_key=R2_SECRET_KEY
 )
 
+async def compress_image_if_needed(file: UploadFile) -> Tuple[io.BytesIO, str]:
+    """
+    Compresses the uploaded image to be under 5MB if needed.
+    Returns a BytesIO buffer ready for upload and a new filename (if converted to JPEG).
+    """
+    original_bytes = await file.read()
+    size_mb = len(original_bytes) / (1024 * 1024)
+
+    if size_mb <= MAX_SIZE_MB:
+        buffer = io.BytesIO(original_bytes)
+        buffer.seek(0)
+        return buffer
+
+    print(f"Original image is {size_mb:.2f}MB. Compressing...")
+
+    image = Image.open(io.BytesIO(original_bytes))
+
+    # Convert to RGB if not already (e.g., for PNG with alpha)
+    if image.mode in ("RGBA", "P"):
+        image = image.convert("RGB")
+
+    # Try compressing to JPEG at reducing quality levels
+    for quality in range(95, 10, -5):
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=quality, optimize=True)
+        size_mb = buffer.tell() / (1024 * 1024)
+        if size_mb <= MAX_SIZE_MB:
+            print(f"Compressed to {size_mb:.2f}MB at quality {quality}")
+            buffer.seek(0)
+            return buffer
+
+    # If unable to compress under 5MB
+    print("Could not compress to under 5MB, uploading with lowest quality.")
+    buffer.seek(0)
+    
+    return buffer
+
+def add_jitter_to_overlapping_coordinates(feedback, jitter_amount=0.05):
+    """
+    Adds a small jitter to overlapping coordinates in the feedback suggestions.
+    jitter_amount: maximum offset to add/subtract (e.g., 0.02 means 2% of the normalized scale)
+    """
+    # Use a dictionary to count occurrences of each coordinate pair (rounded to 2 decimal places)
+    seen = {}
+    
+    for suggestion in feedback.get("suggestions", []):
+        x = round(suggestion["coordinates"]["x"], 2)
+        y = round(suggestion["coordinates"]["y"], 2)
+        key = (x, y)
+        
+        if key in seen:
+            # Increase counter and calculate a new offset based on how many times the pair has been seen
+            count = seen[key]
+            # Option 1: systematic offset - alternate adding and subtracting jitter
+            offset = jitter_amount * (count + 1)
+            # Optionally, randomly decide whether to add or subtract the jitter to x and y
+            new_x = x + offset if random.choice([True, False]) else x - offset
+            new_y = y + offset if random.choice([True, False]) else y - offset
+            
+            # Clamp the values to remain in [0, 1]
+            suggestion["coordinates"]["x"] = max(0, min(1, round(new_x, 2)))
+            suggestion["coordinates"]["y"] = max(0, min(1, round(new_y, 2)))
+            
+            seen[key] += 1
+        else:
+            seen[key] = 1
+    
+    return feedback
+
 @app.get("/")
 def home():
     return {"message": "Backend is running!"}
@@ -72,15 +145,6 @@ def verify_supabase_token(request: Request) -> str:
         print("in if not")
         raise HTTPException(status_code=401, detail="Invalid Authorization Header")
     token = auth_header.split(" ")[1]
-    # Validate token with Supabase
-    # response = requests.get(f"{SUPABASE_URL}/auth/v1/user", headers={"Authorization": f"Bearer {token}"})
-    # print(response)
-    # if response.status_code != 200:
-    #     raise HTTPException(status_code=401, detail="Invalid Token")
-    
-    # user_data = response.json()
-    # email = user_data.get("email")
-    # supabase.auth.set_auth(token)
     user = supabase.auth.get_user(token)
     if not user.user.user_metadata['email']:
         raise HTTPException(status_code=400, detail="Email not found")
@@ -124,11 +188,7 @@ async def upload_image(
         print("in credits less than one")
         raise HTTPException(status_code=402, detail="Insufficient credits. Please purchase more.")
 
-    # **3️⃣ Deduct 1 credit atomically**
-    update_query = supabase.from_("user_credits").update({"credit_balance": credits - 1}).eq("email", user_email).execute()
-    print(update_query)
-    if not update_query.data:
-        raise HTTPException(status_code=500, detail="Failed to deduct credit")
+
 
 
     if style=="landscape and travel":
@@ -138,12 +198,16 @@ async def upload_image(
       style = 'product'
     file_key = f"uploads/{file.filename}"  # File path in R2 bucket
 
+    compressed_buffer = await compress_image_if_needed(file)
+    print(compressed_buffer)
     # Upload image to Cloudflare R2
-    s3_client.upload_fileobj(file.file, R2_BUCKET_NAME, file_key)
-
+    s3_client.upload_fileobj(compressed_buffer, R2_BUCKET_NAME, file_key)
+    
+    # s3_client.upload_fileobj(file.file, R2_BUCKET_NAME, file_key)
+    print("file uploaded")
     # Generate public URL (if bucket allows public access)
     image_url = f"{R2_BUCKET_PUBLIC_ADDRESS}/{file_key}"
-    print
+    print(image_url)
 
     # Update the history messages: Replace the last user message with the new image_url.
     history_messages = json.loads(messages)
@@ -158,6 +222,15 @@ async def upload_image(
         editingSubOption=editingSubOption
 
     ))
+    print(json.dumps(ai_feedback, indent=4))
+
+    # **3️⃣ Deduct 1 credit atomically**
+    update_query = supabase.from_("user_credits").update({"credit_balance": credits - 1}).eq("email", user_email).execute()
+    print(update_query)
+    if not update_query.data:
+        raise HTTPException(status_code=500, detail="Failed to deduct credit")
+    ai_feedback = add_jitter_to_overlapping_coordinates(ai_feedback)
+    print("new feedback")
     print(json.dumps(ai_feedback, indent=4))
     return {"image_url": image_url, "feedback": ai_feedback, "remaining_credits": credits - 1}
 
@@ -256,10 +329,12 @@ def get_ai_feedback(
                                                 "x": {
                                                     "type": "number",
                                                     "description": "Normalized x-coordinate (0 to 1) of the area to improve with 2 decimal places"
+                                                   
                                                 },
                                                 "y": {
                                                     "type": "number",
                                                     "description": "Normalized y-coordinate (0 to 1) of the area to improve with 2 decimal places"
+                                                
                                                 },
                                             },
                                             "required": ["x", "y"],
