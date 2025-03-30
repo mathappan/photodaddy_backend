@@ -90,37 +90,78 @@ async def compress_image_if_needed(file: UploadFile) -> Tuple[io.BytesIO, str]:
     
     return buffer
 
+import random
+
 def add_jitter_to_overlapping_coordinates(feedback, jitter_amount=0.05):
     """
     Adds a small jitter to overlapping coordinates in the feedback suggestions.
-    jitter_amount: maximum offset to add/subtract (e.g., 0.02 means 2% of the normalized scale)
-    """
-    # Use a dictionary to count occurrences of each coordinate pair (rounded to 2 decimal places)
-    seen = {}
+    Also adds jitter to suggestions that share the same exact horizontal (x) 
+    or vertical (y) coordinates.
     
-    for suggestion in feedback.get("suggestions", []):
+    jitter_amount: maximum offset to add/subtract (e.g., 0.05 means 5% of the normalized scale)
+    """
+    suggestions = feedback.get("suggestions", [])
+    
+    # Group suggestions by full (x, y), by x, and by y (all rounded to 2 decimals)
+    coord_dict = {}
+    x_dict = {}
+    y_dict = {}
+    
+    for i, suggestion in enumerate(suggestions):
         x = round(suggestion["coordinates"]["x"], 2)
         y = round(suggestion["coordinates"]["y"], 2)
-        key = (x, y)
+        # update with rounded values
+        suggestion["coordinates"]["x"] = x
+        suggestion["coordinates"]["y"] = y
         
-        if key in seen:
-            # Increase counter and calculate a new offset based on how many times the pair has been seen
-            count = seen[key]
-            # Option 1: systematic offset - alternate adding and subtracting jitter
-            offset = jitter_amount * (count + 1)
-            # Optionally, randomly decide whether to add or subtract the jitter to x and y
-            new_x = x + offset if random.choice([True, False]) else x - offset
-            new_y = y + offset if random.choice([True, False]) else y - offset
-            
-            # Clamp the values to remain in [0, 1]
-            suggestion["coordinates"]["x"] = max(0, min(1, round(new_x, 2)))
-            suggestion["coordinates"]["y"] = max(0, min(1, round(new_y, 2)))
-            
-            seen[key] += 1
-        else:
-            seen[key] = 1
+        # Group by full coordinate
+        coord_dict.setdefault((x, y), []).append(i)
+        # Group by x (horizontal alignment)
+        x_dict.setdefault(x, []).append(i)
+        # Group by y (vertical alignment)
+        y_dict.setdefault(y, []).append(i)
+    
+    # 1. Handle suggestions that overlap exactly (both x and y are the same)
+    for (x, y), indices in coord_dict.items():
+        if len(indices) > 1:
+            for order, idx in enumerate(indices):
+                # Optionally, let the first suggestion remain unchanged
+                if order == 0:
+                    continue
+                offset = jitter_amount * order
+                # Randomly decide the direction of the offset for both coordinates
+                new_x = x + offset if random.choice([True, False]) else x - offset
+                new_y = y + offset if random.choice([True, False]) else y - offset
+                # Clamp values to [0, 1]
+                suggestions[idx]["coordinates"]["x"] = max(0, min(1, round(new_x, 2)))
+                suggestions[idx]["coordinates"]["y"] = max(0, min(1, round(new_y, 2)))
+    
+    # 2. Handle suggestions sharing the same horizontal coordinate (x)
+    for x_val, indices in x_dict.items():
+        if len(indices) > 1:
+            for order, idx in enumerate(indices):
+                # If this suggestion's x is still exactly x_val then add jitter
+                if round(suggestions[idx]["coordinates"]["x"], 2) == x_val:
+                    # Optionally leave the first occurrence untouched
+                    if order == 0:
+                        continue
+                    offset = jitter_amount * order
+                    new_x = x_val + offset if random.choice([True, False]) else x_val - offset
+                    suggestions[idx]["coordinates"]["x"] = max(0, min(1, round(new_x, 2)))
+    
+    # 3. Handle suggestions sharing the same vertical coordinate (y)
+    for y_val, indices in y_dict.items():
+        if len(indices) > 1:
+            for order, idx in enumerate(indices):
+                if round(suggestions[idx]["coordinates"]["y"], 2) == y_val:
+                    if order == 0:
+                        continue
+                    offset = jitter_amount * order
+                    new_y = y_val + offset if random.choice([True, False]) else y_val - offset
+                    suggestions[idx]["coordinates"]["y"] = max(0, min(1, round(new_y, 2)))
     
     return feedback
+
 
 @app.get("/")
 def home():
