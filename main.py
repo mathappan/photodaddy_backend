@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import boto3
 import traceback
 import json
-from prompts import all_prompts
+from prompts import all_prompts, rewriting_for_conversion
 from typing import Optional, Tuple
 from supabase import create_client, Client
 from PIL import Image
@@ -92,7 +92,7 @@ async def compress_image_if_needed(file: UploadFile) -> Tuple[io.BytesIO, str]:
 
 import random
 
-def add_jitter_to_overlapping_coordinates(feedback, jitter_amount=0.05):
+def add_jitter_to_overlapping_coordinates(feedback, jitter_amount=0.1):
     """
     Adds a small jitter to overlapping coordinates in the feedback suggestions.
     Also adds jitter to suggestions that share the same exact horizontal (x) 
@@ -216,7 +216,6 @@ async def upload_image(
     print("editingSubOption:", editingSubOption)
     # **1️⃣ Check if the user has enough credits**
     credit_query = supabase.from_("user_credits").select("credit_balance").eq("email", user_email).single().execute()
-    print(credit_query)
     if not credit_query.data["credit_balance"]:
         print('if not credit_query.data["credit_balance"]:')
         raise HTTPException(status_code=500, detail="Failed to fetch user credits")
@@ -240,7 +239,6 @@ async def upload_image(
     file_key = f"uploads/{file.filename}"  # File path in R2 bucket
 
     compressed_buffer = await compress_image_if_needed(file)
-    print(compressed_buffer)
     # Upload image to Cloudflare R2
     s3_client.upload_fileobj(compressed_buffer, R2_BUCKET_NAME, file_key)
     
@@ -248,7 +246,6 @@ async def upload_image(
     print("file uploaded")
     # Generate public URL (if bucket allows public access)
     image_url = f"{R2_BUCKET_PUBLIC_ADDRESS}/{file_key}"
-    print(image_url)
 
     # Update the history messages: Replace the last user message with the new image_url.
     history_messages = json.loads(messages)
@@ -308,14 +305,15 @@ def get_ai_feedback(
     # Start with the prompt as a user message.
     if mode=='photography':
       conversation.append({
-          "role": "user",
+          "role": "system",
           "content": [{"type": "text", "text": all_prompts[mode][style]}]
       })
     else:
       conversation.append({
-          "role": "user",
+          "role": "system",
           "content": [{"type": "text", "text": all_prompts[mode][editingSubOption][style]}]
       })
+
     # Append each message from the history.
     for msg in history_messages:
         if "user" in msg:
@@ -338,7 +336,7 @@ def get_ai_feedback(
                 "content": [{"type": "text", "text": json.dumps(bot_feedback)}]
             })
     client = openai.OpenAI()
-
+    print(json.dumps(conversation, indent=4))
     try:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -405,3 +403,124 @@ def get_ai_feedback(
         traceback.print_exc()
         print("Error:", e)
         return "Failed to get AI feedback."
+
+
+@app.post("/public-upload/")
+async def upload_image(
+    file: UploadFile = File(...),
+    messages: str = Form(...),  # messages is a JSON string from the frontend
+    style: str = Form(...),
+    mode: str = Form(...),
+    editingSubOption: Optional[str] = Form(None),  # Optional field
+):
+    """
+    Handles image uploads: stores the image in Cloudflare R2 and
+    gets AI feedback. It updates the conversation history so that the
+    latest user message (the image URL) is the one just generated.
+    """
+    try:
+        print("file:", "None" if not file else file.filename)
+        print("style:", style)
+        print("mode:", mode)
+        print("editingSubOption:", editingSubOption)
+        # **1️⃣ Check if the user has enough credits**
+
+        if style=="landscape and travel":
+         style = 'landscape_travel'
+        if style=="landscape":
+         style = 'landscape_travel'
+
+        if style=="Product Photography":
+            style = 'product'
+        file_key = f"uploads/{file.filename}"  # File path in R2 bucket
+
+        compressed_buffer = await compress_image_if_needed(file)
+        # Upload image to Cloudflare R2
+        s3_client.upload_fileobj(compressed_buffer, R2_BUCKET_NAME, file_key)
+        
+        # s3_client.upload_fileobj(file.file, R2_BUCKET_NAME, file_key)
+        print("file uploaded")
+        # Generate public URL (if bucket allows public access)
+        image_url = f"{R2_BUCKET_PUBLIC_ADDRESS}/{file_key}"
+
+        # Update the history messages: Replace the last user message with the new image_url.
+        history_messages = json.loads(messages)
+        
+        history_messages.append({"user": image_url})
+
+ 
+        try:
+        # Call get_ai_feedback with the updated messages and the new image_url.
+            ai_feedback = json.loads(get_ai_feedback(
+                messages=json.dumps(history_messages), 
+                style = style,
+                mode=mode,
+                editingSubOption=editingSubOption
+
+            ))
+            print(json.dumps(ai_feedback, indent=4))
+        except:
+            ai_feedback = json.loads(get_ai_feedback(
+                messages=json.dumps(history_messages), 
+                style = style,
+                mode=mode,
+                editingSubOption=editingSubOption
+
+            ))
+            print(json.dumps(ai_feedback, indent=4))
+
+        ai_feedback = add_jitter_to_overlapping_coordinates(ai_feedback)
+        ai_feedback['to_show'] = -1
+
+        conversation = []
+
+        conversation.append({
+                "role": "system",
+                "content": [{"type": "text", "text": rewriting_for_conversion}]
+            })
+        conversation.append({
+                "role": "user",
+                "content": [{"type": "text", "text": json.dumps(ai_feedback)}]
+            })
+        
+        client = openai.OpenAI()
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=conversation,
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "generate_recipe_response",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                                        "top_level_feedback": {
+                                            "type": "string",
+                                            "description": "Rewritten top level suggestion"
+                                        },
+                                        "index_of_suggestion": {
+                                            "type": "integer",
+                                            "description": "Index of most high converting suggestion"
+                                        },
+                                    },
+                                    "required": [
+                                        "top_level_feedback", "index_of_suggestion"
+                                    ],
+                                    "additionalProperties": False
+                                },
+                    }
+                })
+        response = json.loads(response.choices[0].message.content)
+        ai_feedback['rewritten_top_level_suggestion'] = response['top_level_feedback']
+        ai_feedback['to_show'] = response['index_of_suggestion']
+
+        print("new feedback")
+        print(json.dumps(ai_feedback, indent=4))
+        return {"image_url": image_url, "feedback": ai_feedback }
+
+
+    except Exception as e:
+            traceback.print_exc()
+            print("Error:", e)
+            return "Failed to get AI feedback."
