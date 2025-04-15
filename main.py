@@ -252,8 +252,16 @@ async def upload_image(
     if style=="Product Photography":
       style = 'product'
     file_key = f"uploads/{file.filename}"  # File path in R2 bucket
-
-    compressed_buffer = await compress_image_if_needed(file)
+    filename_lower = file.filename.lower()
+    if filename_lower.endswith(".heic"):
+        print("Converting HEIC to JPG...")
+        file.file.seek(0)
+        jpg_buffer = convert_heic_to_jpg_stream(file)
+        # Adjust file key to .jpg for storage
+        file_key = f"uploads/{os.path.splitext(file.filename)[0]}.jpg"
+        compressed_buffer = await compress_image_if_needed(jpg_buffer)
+    else:
+        compressed_buffer = await compress_image_if_needed(file)
     # Upload image to Cloudflare R2
     s3_client.upload_fileobj(compressed_buffer, R2_BUCKET_NAME, file_key)
     
