@@ -12,6 +12,10 @@ from supabase import create_client, Client
 from PIL import Image
 import io
 import random
+from pillow_heif import register_heif_opener
+import asyncio
+
+register_heif_opener()  # Enables PIL to open HEIC files
 
 MAX_SIZE_MB = 5
 
@@ -58,7 +62,11 @@ async def compress_image_if_needed(file: UploadFile) -> Tuple[io.BytesIO, str]:
     Compresses the uploaded image to be under 5MB if needed.
     Returns a BytesIO buffer ready for upload and a new filename (if converted to JPEG).
     """
-    original_bytes = await file.read()
+    if asyncio.iscoroutinefunction(file.read):
+        original_bytes = await file.read()
+    else:
+        original_bytes = file.read()
+    # original_bytes = await file.read()
     size_mb = len(original_bytes) / (1024 * 1024)
 
     if size_mb <= MAX_SIZE_MB:
@@ -161,6 +169,13 @@ def add_jitter_to_overlapping_coordinates(feedback, jitter_amount=0.1):
                     suggestions[idx]["coordinates"]["y"] = max(0, min(1, round(new_y, 2)))
     
     return feedback
+
+def convert_heic_to_jpg_stream(uploaded_file: UploadFile) -> io.BytesIO:
+    image = Image.open(uploaded_file.file)
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", quality=95)
+    buffer.seek(0)
+    return buffer
 
 
 @app.get("/")
@@ -434,7 +449,16 @@ async def upload_image(
             style = 'product'
         file_key = f"uploads/{file.filename}"  # File path in R2 bucket
 
-        compressed_buffer = await compress_image_if_needed(file)
+        filename_lower = file.filename.lower()
+        if filename_lower.endswith(".heic"):
+            print("Converting HEIC to JPG...")
+            file.file.seek(0)
+            jpg_buffer = convert_heic_to_jpg_stream(file)
+            # Adjust file key to .jpg for storage
+            file_key = f"uploads/{os.path.splitext(file.filename)[0]}.jpg"
+            compressed_buffer = await compress_image_if_needed(jpg_buffer)
+        else:
+            compressed_buffer = await compress_image_if_needed(file)
         # Upload image to Cloudflare R2
         s3_client.upload_fileobj(compressed_buffer, R2_BUCKET_NAME, file_key)
         
